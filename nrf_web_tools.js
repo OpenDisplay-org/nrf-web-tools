@@ -12,8 +12,9 @@ class NrfWebTools {
     this.hciSequenceNumber = 0;
     this.resolveAck = null;
     this.ackTimeout = null;
-    this.currentState = 'WELCOME'; // WELCOME, LOADING, INSTALLING, WAITING_CONTINUE, SUCCESS, ERROR
+    this.currentState = 'WELCOME'; // WELCOME, LOADING, INSTALLING, WAITING_CONTINUE, WAITING_RECONNECT, SUCCESS, ERROR
     this.flashState = null; // Store state for continuing after reset
+    this.currentFirmwareIndex = 0; // Track which firmware we're currently flashing
     
     // Constants
     this.SLIP_END = 0xC0;
@@ -106,7 +107,7 @@ class NrfWebTools {
     
     // Show/hide close button based on state
     if (closeBtn) {
-      const shouldHide = (state === 'INSTALLING' || state === 'WAITING_CONTINUE');
+      const shouldHide = (state === 'INSTALLING' || state === 'WAITING_CONTINUE' || state === 'WAITING_RECONNECT');
       closeBtn.style.display = shouldHide ? 'none' : 'block';
       // Ensure button is clickable when visible
       if (!shouldHide) {
@@ -131,6 +132,9 @@ class NrfWebTools {
         break;
       case 'WAITING_CONTINUE':
         this.renderWaitingContinuePage(headlineEl, contentEl, actionsEl, data);
+        break;
+      case 'WAITING_RECONNECT':
+        this.renderWaitingReconnectPage(headlineEl, contentEl, actionsEl, data);
         break;
       case 'SUCCESS':
         this.renderSuccessPage(headlineEl, contentEl, actionsEl, data);
@@ -242,6 +246,29 @@ class NrfWebTools {
     }
   }
   
+  renderWaitingReconnectPage(headline, content, actions, data) {
+    headline.innerHTML = '<h3>Reconnect Device</h3>';
+    content.innerHTML = `
+      <div class="nrf52-dfu-message-page">
+        <div class="nrf52-dfu-message-icon">🔄</div>
+        <p>${data.message || 'Device needs to be reconnected for the next firmware part.'}</p>
+        <p class="nrf52-dfu-details">${data.details || 'Click "Reconnect" below to select your device again. You will be prompted to select your device.'}</p>
+      </div>
+    `;
+    actions.innerHTML = `
+      <button class="nrf52-dfu-btn nrf52-dfu-btn-primary" id="nrf52-dfu-reconnect-btn">Reconnect</button>
+      <button class="nrf52-dfu-btn nrf52-dfu-btn-secondary" id="nrf52-dfu-reset-again-btn">Reset Again</button>
+    `;
+    const reconnectBtn = document.getElementById('nrf52-dfu-reconnect-btn');
+    const resetAgainBtn = document.getElementById('nrf52-dfu-reset-again-btn');
+    if (reconnectBtn) {
+      reconnectBtn.onclick = () => this.reconnectAndContinue();
+    }
+    if (resetAgainBtn) {
+      resetAgainBtn.onclick = () => this.resetAndReconnect();
+    }
+  }
+  
   renderErrorPage(headline, content, actions, data) {
     headline.innerHTML = '<h3>Error</h3>';
     content.innerHTML = `
@@ -254,11 +281,26 @@ class NrfWebTools {
     actions.innerHTML = `
       <button class="nrf52-dfu-btn nrf52-dfu-btn-secondary" onclick="document.getElementById('nrf52-dfu-modal').querySelector('#nrf52-dfu-close-btn').click()">Close</button>
       ${data.retry ? `<button class="nrf52-dfu-btn nrf52-dfu-btn-primary" id="nrf52-dfu-retry-btn">Retry</button>` : ''}
+      ${data.retryFromReconnect ? `<button class="nrf52-dfu-btn nrf52-dfu-btn-primary" id="nrf52-dfu-retry-reconnect-btn">Retry Reconnect</button>` : ''}
     `;
     if (data.retry) {
       const retryBtn = document.getElementById('nrf52-dfu-retry-btn');
       if (retryBtn) {
-        retryBtn.onclick = () => this.startInstall();
+        retryBtn.onclick = () => {
+          if (data.retryFromReconnect && this.flashState) {
+            // Continue from reconnection step
+            this.reconnectAndContinue();
+          } else {
+            // Start from beginning
+            this.startInstall();
+          }
+        };
+      }
+    }
+    if (data.retryFromReconnect) {
+      const retryReconnectBtn = document.getElementById('nrf52-dfu-retry-reconnect-btn');
+      if (retryReconnectBtn) {
+        retryReconnectBtn.onclick = () => this.reconnectAndContinue();
       }
     }
   }
@@ -1095,7 +1137,11 @@ class NrfWebTools {
         });
         
         // Store state so continueFlash can access it
-        this.flashState = { firmwareQueue: this.firmwareQueue };
+        this.flashState = { 
+          firmwareQueue: this.firmwareQueue,
+          currentFirmwareIndex: 0
+        };
+        this.currentFirmwareIndex = 0;
       } catch (portError) {
         // Check if user cancelled the port selection
         if (portError instanceof DOMException && portError.name === 'NotFoundError') {
@@ -1124,6 +1170,12 @@ class NrfWebTools {
   
   async continueFlash() {
     try {
+      // Restore state if available
+      if (this.flashState) {
+        this.firmwareQueue = this.flashState.firmwareQueue;
+        this.currentFirmwareIndex = this.flashState.currentFirmwareIndex || 0;
+      }
+      
       // Step 2: Flash firmware (115200 baud)
       // This is now called from a button click, so we're in a user gesture context
       this.renderPage('INSTALLING', {
@@ -1147,36 +1199,219 @@ class NrfWebTools {
       this.log("Starting DFU...", 'info');
       this.updateProgress(0, 'Preparing installation');
       
-      // Flash each firmware type in order
-      for (let i = 0; i < this.firmwareQueue.length; i++) {
-        const fw = this.firmwareQueue[i];
-        const progressBase = (i / this.firmwareQueue.length) * 100;
-        const progressRange = 100 / this.firmwareQueue.length;
-        
-        this.updateProgress(progressBase, `Installing ${fw.type}...`);
-        
-        await this.flashSingleFirmware(fw, progressBase, progressRange);
-      }
-      
-      this.log("\n✓ DFU complete! All firmware types flashed successfully.", 'success');
-      this.updateProgress(100, 'Installation complete');
-      await this.sleep(500);
-      
-      await this.disconnectPort();
-      
-      this.renderPage('SUCCESS', {
-        message: `Firmware has been successfully installed!<br>${this.firmwareQueue.length} firmware type(s) flashed.`
-      });
+      // Flash each firmware type in order, starting from current index
+      await this.flashRemainingFirmware();
       
     } catch (e) {
       this.log("DFU error: " + e, 'error');
       await this.disconnectPort();
       
-      this.renderPage('ERROR', {
-        message: 'Installation failed',
-        details: e.message,
-        retry: true
+      // Check if this is a connection error and we have more firmware to flash
+      const isConnectionError = e.message && (
+        e.message.includes('Failed to get ACK') || 
+        e.message.includes('ACK timeout') ||
+        e.message.includes('NotFoundError')
+      );
+      
+      if (isConnectionError && this.currentFirmwareIndex < this.firmwareQueue.length) {
+        // Connection lost, need to reconnect
+        this.flashState = {
+          firmwareQueue: this.firmwareQueue,
+          currentFirmwareIndex: this.currentFirmwareIndex
+        };
+        this.renderPage('WAITING_RECONNECT', {
+          message: 'Connection lost. Device may have reset after flashing.',
+          details: `Need to reconnect to continue flashing remaining firmware (${this.firmwareQueue.length - this.currentFirmwareIndex} part(s) remaining).`
+        });
+      } else {
+        this.renderPage('ERROR', {
+          message: 'Installation failed',
+          details: e.message,
+          retry: true,
+          retryFromReconnect: (this.currentFirmwareIndex > 0 && this.currentFirmwareIndex < this.firmwareQueue.length)
+        });
+      }
+    }
+  }
+  
+  async flashRemainingFirmware() {
+    // Flash each firmware type in order, starting from current index
+    for (let i = this.currentFirmwareIndex; i < this.firmwareQueue.length; i++) {
+      const fw = this.firmwareQueue[i];
+      this.currentFirmwareIndex = i;
+      
+      // Update flash state
+      if (this.flashState) {
+        this.flashState.currentFirmwareIndex = i;
+      }
+      
+      const progressBase = (i / this.firmwareQueue.length) * 100;
+      const progressRange = 100 / this.firmwareQueue.length;
+      
+      this.updateProgress(progressBase, `Installing ${fw.type}...`);
+      
+      await this.flashSingleFirmware(fw, progressBase, progressRange);
+      
+      // Check if this firmware type might cause a reset and if there's more to flash
+      const mightReset = fw.type === 'softdevice+bootloader' || fw.type === 'softdevice' || fw.type === 'bootloader';
+      const hasMoreFirmware = (i + 1) < this.firmwareQueue.length;
+      
+      if (mightReset && hasMoreFirmware) {
+        // Device likely reset, need to reconnect for next firmware
+        this.log(`\n${fw.type} flashed. Device may have reset. Need to reconnect for next firmware part.`, 'info');
+        await this.disconnectPort();
+        
+        // Update state
+        this.currentFirmwareIndex = i + 1;
+        this.flashState = {
+          firmwareQueue: this.firmwareQueue,
+          currentFirmwareIndex: i + 1
+        };
+        
+        // Prompt user to reconnect
+        this.renderPage('WAITING_RECONNECT', {
+          message: `${fw.type} installed successfully!`,
+          details: `Device needs to be reconnected to continue with the next firmware part (${this.firmwareQueue.length - i - 1} remaining). Click "Reconnect" to continue.`
+        });
+        return; // Exit, will continue when user clicks reconnect
+      }
+    }
+    
+    // All firmware flashed successfully
+    this.log("\n✓ DFU complete! All firmware types flashed successfully.", 'success');
+    this.updateProgress(100, 'Installation complete');
+    await this.sleep(500);
+    
+    await this.disconnectPort();
+    
+    this.renderPage('SUCCESS', {
+      message: `Firmware has been successfully installed!<br>${this.firmwareQueue.length} firmware type(s) flashed.`
+    });
+  }
+  
+  async reconnectAndContinue() {
+    try {
+      // Restore state
+      if (this.flashState) {
+        this.firmwareQueue = this.flashState.firmwareQueue;
+        this.currentFirmwareIndex = this.flashState.currentFirmwareIndex || 0;
+      }
+      
+      this.renderPage('INSTALLING', {
+        progress: (this.currentFirmwareIndex / this.firmwareQueue.length) * 100,
+        label: 'Reconnecting to device',
+        details: 'Please select your device again'
       });
+      this.log(`=== Reconnecting for firmware part ${this.currentFirmwareIndex + 1}/${this.firmwareQueue.length} ===`, 'info');
+      this.log("Please select your device...", 'info');
+      
+      await this.disconnectPort();
+      
+      this.port = await navigator.serial.requestPort();
+      await this.port.open({ baudRate: 115200 });
+      this.writer = this.port.writable.getWriter();
+      this.reader = this.port.readable.getReader();
+      this.rxBuf = [];
+      this.hciSequenceNumber = 0;
+      this.readLoop();
+      await this.sleep(100);
+      
+      this.log("✓ Reconnected successfully", 'success');
+      
+      // Continue flashing remaining firmware
+      await this.flashRemainingFirmware();
+      
+    } catch (e) {
+      this.log("Reconnection error: " + e, 'error');
+      await this.disconnectPort();
+      
+      // Check if user cancelled
+      if (e instanceof DOMException && e.name === 'NotFoundError') {
+        this.renderPage('WAITING_RECONNECT', {
+          message: 'Reconnection cancelled',
+          details: 'You can try "Reconnect" again, or use "Reset Again" to perform another reset cycle if the device is not responding.'
+        });
+      } else {
+        this.renderPage('ERROR', {
+          message: 'Reconnection failed',
+          details: e.message + '. You can try "Reconnect" again, or use "Reset Again" to perform another reset cycle.',
+          retry: true,
+          retryFromReconnect: true
+        });
+      }
+    }
+  }
+  
+  async resetAndReconnect() {
+    try {
+      // Restore state
+      if (this.flashState) {
+        this.firmwareQueue = this.flashState.firmwareQueue;
+        this.currentFirmwareIndex = this.flashState.currentFirmwareIndex || 0;
+      }
+      
+      this.renderPage('INSTALLING', {
+        progress: (this.currentFirmwareIndex / this.firmwareQueue.length) * 100,
+        label: 'Resetting device again',
+        details: 'Please select your device for reset'
+      });
+      this.log("=== Resetting device again ===", 'info');
+      this.log("Please select your device for reset...", 'info');
+      
+      await this.disconnectPort();
+      
+      const resetPort = await navigator.serial.requestPort();
+      await resetPort.open({ baudRate: 1200 });
+      await resetPort.close();
+      this.log("✓ Reset triggered - device entering DFU mode", 'success');
+      await this.sleep(500);
+      
+      // Update state
+      this.flashState = {
+        firmwareQueue: this.firmwareQueue,
+        currentFirmwareIndex: this.currentFirmwareIndex
+      };
+      
+      // Now reconnect and continue
+      this.renderPage('INSTALLING', {
+        progress: (this.currentFirmwareIndex / this.firmwareQueue.length) * 100,
+        label: 'Reconnecting to device',
+        details: 'Please select your device again'
+      });
+      this.log("=== Reconnecting after reset ===", 'info');
+      this.log("Please select your device...", 'info');
+      
+      this.port = await navigator.serial.requestPort();
+      await this.port.open({ baudRate: 115200 });
+      this.writer = this.port.writable.getWriter();
+      this.reader = this.port.readable.getReader();
+      this.rxBuf = [];
+      this.hciSequenceNumber = 0;
+      this.readLoop();
+      await this.sleep(100);
+      
+      this.log("✓ Reconnected successfully", 'success');
+      
+      // Continue flashing remaining firmware
+      await this.flashRemainingFirmware();
+      
+    } catch (e) {
+      this.log("Reset error: " + e, 'error');
+      await this.disconnectPort();
+      
+      if (e instanceof DOMException && e.name === 'NotFoundError') {
+        this.renderPage('WAITING_RECONNECT', {
+          message: 'Reset cancelled',
+          details: 'You can try again, or use "Reconnect" if the device is already in DFU mode.'
+        });
+      } else {
+        this.renderPage('ERROR', {
+          message: 'Reset failed',
+          details: e.message,
+          retry: true,
+          retryFromReconnect: true
+        });
+      }
     }
   }
 }
